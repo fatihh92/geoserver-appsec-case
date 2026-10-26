@@ -66,16 +66,30 @@ def codeql_findings(directory):
     return findings
 
 
-def trivy_findings(filename, report_only=False):
+def trivy_findings(filename, report_only=False, coverage_warnings=None):
     report = json.loads(Path(filename).read_text())
     if report.get('SchemaVersion') != 2 or not isinstance(report.get('Results'), list):
         raise ValueError('Invalid Trivy report schema')
     packages = 0
     findings = []
+    warnings = []
     for result in report['Results']:
         for package in result.get('Packages', []):
-            if not package.get('Name') or not package.get('Version'):
-                raise ValueError('A dependency name or version is unresolved')
+            name = package.get('Name')
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError('A dependency name is missing or invalid')
+            version = package.get('Version')
+            if version is not None and not isinstance(version, str):
+                raise ValueError('A dependency version has an invalid type')
+            if not version or not version.strip() or '${' in version:
+                warnings.append({
+                    'reason': 'unresolved-version',
+                    'target': result.get('Target'),
+                    'package': name,
+                    'version': version,
+                    'relationship': package.get('Relationship'),
+                    'locations': package.get('Locations', []),
+                })
             packages += 1
         for vuln in result.get('Vulnerabilities', []):
             severity = vuln.get('Severity')
@@ -93,6 +107,10 @@ def trivy_findings(filename, report_only=False):
                 })
     if packages == 0:
         raise ValueError('No dependency inventory found; a clean scan cannot be claimed')
+    if coverage_warnings is not None:
+        coverage_warnings.extend(warnings)
+    elif warnings and not report_only:
+        raise ValueError('Dependency versions are unresolved')
     return findings
 
 
@@ -103,12 +121,16 @@ def main():
     parser.add_argument('--mode', choices=['enforce', 'report-only'], default='enforce')
     args = parser.parse_args()
     try:
+        coverage_warnings = []
         findings = (codeql_findings(args.report) if args.scanner == 'codeql'
-                    else trivy_findings(args.report, report_only=args.mode == 'report-only'))
-        blocked = bool(findings) and args.mode == 'enforce'
+                    else trivy_findings(args.report, report_only=args.mode == 'report-only',
+                                        coverage_warnings=coverage_warnings))
+        blocked = bool(findings or coverage_warnings) and args.mode == 'enforce'
         status = 'reported' if args.mode == 'report-only' else ('blocked' if blocked else 'passed')
         result = {'scanner': args.scanner, 'mode': args.mode, 'status': status,
-                  'high_critical_findings': findings}
+                  'high_critical_findings': findings,
+                  'coverage_warnings': coverage_warnings,
+                  'unresolved_version_count': len(coverage_warnings)}
         exit_code = 1 if blocked else 0
     except (ValueError, OSError, KeyError, TypeError, AttributeError) as exc:
         result = {'scanner': args.scanner, 'mode': args.mode, 'status': 'invalid-evidence', 'error': str(exc)}
@@ -122,6 +144,10 @@ def main():
         with open(summary, 'a') as stream:
             stream.write(f'### {args.scanner}: {result["status"]}\n\n')
             stream.write(f'Mode: {args.mode}. See the report artifacts for details.\n\n')
+            if result.get('coverage_warnings'):
+                stream.write(f'Coverage warning: {result["unresolved_version_count"]} package '
+                             'records have unresolved versions. See coverage_warnings in '
+                             'the JSON artifact; dependency coverage is incomplete.\n\n')
             if args.mode == 'report-only':
                 stream.write('Report-only does not certify the absence of vulnerabilities.\n\n')
     return exit_code

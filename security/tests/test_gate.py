@@ -164,6 +164,48 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(result['status'], 'reported')
 
+    def test_any_unresolved_versions_are_collected_in_both_modes(self):
+        for count in [1, 17]:
+            self.trivy['Results'][0]['Packages'] = [
+                {'Name': f'arbitrary:package-{i}', 'Version': [None, '', '  ', '${revision}'][i % 4]}
+                for i in range(count)]
+            self.trivy['Results'][0]['Vulnerabilities'] = [{
+                'Severity': 'HIGH', 'PkgName': 'known:library',
+                'InstalledVersion': '1', 'VulnerabilityID': 'CVE-TEST'}]
+            path = self.write('trivy.json', self.trivy)
+            for mode, expected in [('enforce', 1), ('report-only', 0)]:
+                with self.subTest(count=count, mode=mode):
+                    code, result = self.run_cli('trivy', path, mode)
+                    self.assertEqual(code, expected)
+                    self.assertEqual(result['unresolved_version_count'], count)
+                    self.assertEqual(len(result['coverage_warnings']), count)
+                    self.assertEqual(len(result['high_critical_findings']), 1)
+
+    def test_missing_version_without_vulnerabilities(self):
+        del self.trivy['Results'][0]['Packages'][0]['Version']
+        path = self.write('trivy.json', self.trivy)
+        for mode, expected in [('enforce', 1), ('report-only', 0)]:
+            code, result = self.run_cli('trivy', path, mode)
+            self.assertEqual(code, expected)
+            self.assertEqual(result['unresolved_version_count'], 1)
+
+    def test_report_only_missing_name_is_still_invalid(self):
+        del self.trivy['Results'][0]['Packages'][0]['Name']
+        code, result = self.run_cli('trivy', self.write('trivy.json', self.trivy), 'report-only')
+        self.assertEqual(code, 2)
+        self.assertEqual(result['status'], 'invalid-evidence')
+
+    def test_report_only_invalid_version_type_is_still_invalid(self):
+        self.trivy['Results'][0]['Packages'][0]['Version'] = {'unexpected': 'object'}
+        code, result = self.run_cli('trivy', self.write('trivy.json', self.trivy), 'report-only')
+        self.assertEqual(code, 2)
+
+    def test_report_only_malformed_json_is_still_invalid(self):
+        path = self.root / 'broken.json'
+        path.write_text('{broken')
+        code, result = self.run_cli('trivy', path, 'report-only')
+        self.assertEqual(code, 2)
+
 
 if __name__ == '__main__':
     unittest.main()

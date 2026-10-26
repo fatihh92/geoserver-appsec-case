@@ -23,7 +23,11 @@ Report-only başarısı açık olmadığı veya yayın onayı verildiği anlamı
 CodeQL güvenlik kural puanı >=7, Trivy HIGH/CRITICAL enforce modunu durdurur.
 Trivy UNKNOWN bulguları report-only modunda orijinal JSON/SARIF raporunda korunur;
 enforce modunda inceleme gerektirdiği için başarısızlık oluşturur.
-Eksik/bozuk rapor, boş Trivy envanteri ve rapordaki sürümsüz paketler iki modda da başarısızdır.
+Eksik/bozuk rapor, eksik paket adı ve boş Trivy envanteri iki modda da başarısızdır.
+Sürümü bulunmayan, boş veya çözülmemiş Maven değişkeni içeren tüm paket kayıtları
+coverage_warnings altında hedef ve konum bilgileriyle saklanır; belirli paket veya
+sayı listesi kullanılmaz. Bunlar enforce modunda başarısızlık, report-only modunda
+kapsam uyarısı oluşturur. report-only başarısı tam bağımlılık kapsamı anlamına gelmez.
 continue-on-error, baseline, ignore listesi veya açıkları filtreleyerek yeşile çevirme kullanılmaz.
 
 ## İlk ve ikinci koşu

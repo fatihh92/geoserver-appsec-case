@@ -1,0 +1,87 @@
+name: SAST - CodeQL
+
+on:
+  push:
+    branches: [appsec/geoserver-2.25.1]
+  pull_request:
+    branches: [appsec/geoserver-2.25.1]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'enforce: fail on HIGH/CRITICAL; report-only: report findings'
+        type: choice
+        required: true
+        default: enforce
+        options:
+          - enforce
+          - report-only
+  # Runs on the default branch. Set the case branch as default to enable this.
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  SCAN_MODE: ${{ inputs.mode || 'enforce' }}
+
+concurrency:
+  group: appsec-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+run-name: "SAST - CodeQL / ${{ inputs.mode || 'enforce' }} / ${{ github.ref_name }}"
+
+jobs:
+  codeql:
+    name: CodeQL SAST
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record analyzed source
+        run: |
+          mkdir -p reports/codeql
+          git rev-parse HEAD > reports/source-commit.txt
+          python3 -m unittest discover -s security/tests -v
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Initialize CodeQL (source analysis without build)
+        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: java-kotlin
+          build-mode: none
+          queries: security-extended
+      - name: Analyze Java source
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          output: reports/codeql
+          upload: never
+          upload-database: false
+          category: appsec-codeql-java
+      - name: Upload CodeQL results to Security tab
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: reports/codeql
+          category: appsec-codeql-java
+      - name: Evaluate SAST results in selected mode
+        run: python3 security/gate.py codeql reports/codeql --mode "$SCAN_MODE"
+      - name: Preserve CodeQL evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codeql-${{ env.SCAN_MODE }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports/
+          if-no-files-found: error
+          retention-days: 30

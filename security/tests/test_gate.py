@@ -3,6 +3,8 @@
 import copy
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -66,6 +68,33 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             gate.codeql_findings(self.root)
 
+    def test_codeql_query_pack_extension_rules_are_supported(self):
+        run = self.sarif['runs'][0]
+        rules = run['tool']['driver'].pop('rules')
+        run['tool']['driver']['rules'] = []
+        run['tool']['extensions'] = [{'name': 'codeql/java-queries', 'rules': rules}]
+        run['results'] = [{'ruleId': 'java/example', 'rule': {
+            'id': 'java/example', 'index': 0, 'toolComponent': {'index': 0},
+        }}]
+        self.write('java.sarif', self.sarif)
+        self.assertEqual(len(gate.codeql_findings(self.root)), 1)
+
+    def test_codeql_clean_extension_report_passes(self):
+        run = self.sarif['runs'][0]
+        rules = run['tool']['driver'].pop('rules')
+        run['tool']['extensions'] = [{'name': 'codeql/java-queries', 'rules': rules}]
+        self.write('java.sarif', self.sarif)
+        self.assertEqual(gate.codeql_findings(self.root), [])
+
+    def test_codeql_conflicting_rule_definitions_fail(self):
+        run = self.sarif['runs'][0]
+        other = copy.deepcopy(run['tool']['driver']['rules'])
+        other[0]['properties']['security-severity'] = '0.0'
+        run['tool']['extensions'] = [{'name': 'other-pack', 'rules': other}]
+        self.write('java.sarif', self.sarif)
+        with self.assertRaises(ValueError):
+            gate.codeql_findings(self.root)
+
     def test_trivy_clean_inventory_passes(self):
         self.assertEqual(gate.trivy_findings(self.write('trivy.json', self.trivy)), [])
 
@@ -92,6 +121,48 @@ class PolicyTests(unittest.TestCase):
         self.trivy['Results'][0]['Vulnerabilities'] = [{'Severity': 'UNKNOWN'}]
         with self.assertRaises(ValueError):
             gate.trivy_findings(self.write('trivy.json', self.trivy))
+
+    def run_cli(self, scanner, report, mode):
+        proc = subprocess.run(
+            [sys.executable, '-B', str(Path(gate.__file__).resolve()),
+             scanner, str(report), '--mode', mode],
+            cwd=self.root, capture_output=True, text=True)
+        return proc.returncode, json.loads(proc.stdout)
+
+    def test_cli_modes_for_both_scanners(self):
+        self.sarif['runs'][0]['results'] = [{'ruleId': 'java/example'}]
+        self.write('java.sarif', self.sarif)
+        self.trivy['Results'][0]['Vulnerabilities'] = [{
+            'Severity': 'CRITICAL', 'PkgName': 'example:library',
+            'InstalledVersion': '1.0', 'VulnerabilityID': 'CVE-TEST'}]
+        trivy_path = self.write('trivy.json', self.trivy)
+        for scanner, report in [('codeql', self.root), ('trivy', trivy_path)]:
+            for mode, expected, status in [('enforce', 1, 'blocked'),
+                                            ('report-only', 0, 'reported')]:
+                with self.subTest(scanner=scanner, mode=mode):
+                    code, result = self.run_cli(scanner, report, mode)
+                    self.assertEqual(code, expected)
+                    self.assertEqual(result['status'], status)
+                    self.assertEqual(len(result['high_critical_findings']), 1)
+
+    def test_report_only_missing_reports_still_fail(self):
+        for scanner in ['codeql', 'trivy']:
+            with self.subTest(scanner=scanner):
+                code, result = self.run_cli(scanner, self.root / 'missing', 'report-only')
+                self.assertEqual(code, 2)
+                self.assertEqual(result['status'], 'invalid-evidence')
+
+    def test_report_only_empty_inventory_still_fails(self):
+        self.trivy['Results'][0]['Packages'] = []
+        code, result = self.run_cli('trivy', self.write('trivy.json', self.trivy), 'report-only')
+        self.assertEqual(code, 2)
+        self.assertEqual(result['status'], 'invalid-evidence')
+
+    def test_report_only_unknown_severity_is_reported(self):
+        self.trivy['Results'][0]['Vulnerabilities'] = [{'Severity': 'UNKNOWN'}]
+        code, result = self.run_cli('trivy', self.write('trivy.json', self.trivy), 'report-only')
+        self.assertEqual(code, 0)
+        self.assertEqual(result['status'], 'reported')
 
 
 if __name__ == '__main__':

@@ -1,0 +1,12 @@
+# Route only Maven Central POM lookups through the documented GCS mirror.
+# OSGeo and other project-specific repositories are not remapped.
+# This changes transport, not the scanned paths, severities or security policy.
+scan:
+  maven:
+    mirrors:
+      - source: https://repo.maven.apache.org/maven2/
+        targets:
+          - https://maven-central.storage-download.googleapis.com/maven2/
+      - source: https://repo1.maven.org/maven2/
+        targets:
+          - https://maven-central.storage-download.googleapis.com/maven2/

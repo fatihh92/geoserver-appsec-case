@@ -1,7 +1,7 @@
 """Fail closed on invalid reports; block HIGH/CRITICAL SAST and SCA results.
 
 No baselines, severity overrides, or suppression lists are accepted by this PoC.
-Exit 0: policy passed, 1: blocking findings, 2: invalid/incomplete evidence.
+Exit 0: policy passed or findings reported, 1: blocked, 2: invalid evidence.
 """
 
 import argparse
@@ -28,7 +28,16 @@ def codeql_findings(directory):
             for invocation in run.get('invocations', []):
                 if invocation.get('executionSuccessful') is False:
                     raise ValueError('CodeQL execution was unsuccessful')
-            rules = {rule['id']: rule for rule in driver.get('rules', [])}
+            # CodeQL query packs can store descriptors in tool.extensions,
+            # while tool.driver.rules is empty. Do not treat that as no rules.
+            components = [driver] + run['tool'].get('extensions', [])
+            rules = {}
+            for component in components:
+                for rule in component.get('rules', []):
+                    rule_id = rule['id']
+                    if rule_id in rules and rules[rule_id] != rule:
+                        raise ValueError('Ambiguous CodeQL rule definitions')
+                    rules[rule_id] = rule
             if not rules or not isinstance(run.get('results'), list):
                 raise ValueError('CodeQL rule definitions or results are missing')
             for result in run['results']:
@@ -46,11 +55,18 @@ def codeql_findings(directory):
                 if not math.isfinite(score) or not 0 <= score <= 10:
                     raise ValueError('Invalid CodeQL security-severity')
                 if score >= 7:
-                    findings.append({'rule': rule_id, 'security_severity': score})
+                    locations = result.get('locations', [])
+                    physical = locations[0].get('physicalLocation', {}) if locations else {}
+                    findings.append({
+                        'rule': rule_id,
+                        'security_severity': score,
+                        'file': physical.get('artifactLocation', {}).get('uri'),
+                        'line': physical.get('region', {}).get('startLine'),
+                    })
     return findings
 
 
-def trivy_findings(filename):
+def trivy_findings(filename, report_only=False):
     report = json.loads(Path(filename).read_text())
     if report.get('SchemaVersion') != 2 or not isinstance(report.get('Results'), list):
         raise ValueError('Invalid Trivy report schema')
@@ -63,6 +79,8 @@ def trivy_findings(filename):
             packages += 1
         for vuln in result.get('Vulnerabilities', []):
             severity = vuln.get('Severity')
+            if severity == 'UNKNOWN' and report_only:
+                continue
             if severity not in {'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'}:
                 raise ValueError('A vulnerability has unknown or missing severity; review required')
             if severity in {'HIGH', 'CRITICAL'}:
@@ -82,14 +100,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('scanner', choices=['codeql', 'trivy'])
     parser.add_argument('report')
+    parser.add_argument('--mode', choices=['enforce', 'report-only'], default='enforce')
     args = parser.parse_args()
     try:
-        findings = (codeql_findings if args.scanner == 'codeql' else trivy_findings)(args.report)
-        status = 'blocked' if findings else 'passed'
-        result = {'scanner': args.scanner, 'status': status, 'blocking_findings': findings}
-        exit_code = 1 if findings else 0
+        findings = (codeql_findings(args.report) if args.scanner == 'codeql'
+                    else trivy_findings(args.report, report_only=args.mode == 'report-only'))
+        blocked = bool(findings) and args.mode == 'enforce'
+        status = 'reported' if args.mode == 'report-only' else ('blocked' if blocked else 'passed')
+        result = {'scanner': args.scanner, 'mode': args.mode, 'status': status,
+                  'high_critical_findings': findings}
+        exit_code = 1 if blocked else 0
     except (ValueError, OSError, KeyError, TypeError, AttributeError) as exc:
-        result = {'scanner': args.scanner, 'status': 'invalid-evidence', 'error': str(exc)}
+        result = {'scanner': args.scanner, 'mode': args.mode, 'status': 'invalid-evidence', 'error': str(exc)}
         exit_code = 2
     output = json.dumps(result, indent=2)
     print(output)
@@ -99,7 +121,9 @@ def main():
     if summary:
         with open(summary, 'a') as stream:
             stream.write(f'### {args.scanner}: {result["status"]}\n\n')
-            stream.write('See the report artifacts for details.\n\n')
+            stream.write(f'Mode: {args.mode}. See the report artifacts for details.\n\n')
+            if args.mode == 'report-only':
+                stream.write('Report-only does not certify the absence of vulnerabilities.\n\n')
     return exit_code
 
 
